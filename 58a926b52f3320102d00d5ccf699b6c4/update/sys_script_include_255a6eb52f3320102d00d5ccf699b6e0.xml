@@ -1,0 +1,418 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_10255_phishlabs.GetIncidents</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description/>
+        <name>GetIncidents</name>
+        <script><![CDATA[var GetIncidents = Class.create();
+GetIncidents.prototype = {
+	initialize: function() {},
+	/**
+     * Main function called by the scheduled Job : Phishing Employee PhishLabs refresh 
+     * JSON response will be processed till next page is empty
+     */
+	serverCall: function() {
+		this.getByMessageID();
+
+		try {
+			var response;
+			var secInc = new GlideRecord('sn_si_incident');
+			secInc.addEncodedQuery('alert_sensor.alert_sensor=User Reported Phish^active=true^u_closedISEMPTY');
+			secInc.orderBy('sys_created_on');
+			secInc.setLimit(1);
+			secInc.query();
+			var d;
+
+			if (secInc.next()) {
+				d = new GlideDateTime(secInc.sys_created_on);
+			} else {
+				d = new GlideDateTime();
+			}
+
+			d.addDaysUTC(-1);
+			var ms = d.getNumericValue();
+			var after = new Date(ms).toISOString();
+			var nextpage = 'v1/incidents/EIR?created_after=' + after + '&limit=50&extend_attachments=true';
+			//var nextpage = 'created_after=' + after;
+			gs.debug('Checking for PhishLabs updates : ' + nextpage);
+
+			do {
+				var r = new sn_ws.RESTMessageV2('x_ingmb_phishlabs.PhishLabs Incident', 'GET Incident');
+				gs.debug('Next Page: ' + nextpage);
+				r.setStringParameterNoEscape('nextpage', nextpage);
+				response = r.execute();
+				var responseBody = response.getBody();
+				var httpStatus = response.getStatusCode();
+
+				if (httpStatus == 200) {
+					var responseObj = JSON.parse(responseBody);
+					JSON.stringify(response.getHeaders());
+
+					this.processIncidents(responseObj);
+
+					nextpage = response.getHeader('X-Nextlocation');
+					gs.debug("PhishLabs current response page " + response.getHeader('X-Currentpage'));
+				} else {
+					gs.error("Error in response : " + httpStatus + "Error details : " + responseBody);
+				}
+			}
+
+			while (nextpage != null);
+		} catch (ex) {
+			var message = ex.message;
+			gs.error(message);
+		}
+	},
+	/**
+     *  Function used to process responeObj and process the mapping
+     *
+     * @param {*} responseObj
+    /**
+     *  Function is used to convert date from ISO fromat to local format by using script include : ConvertISOToDateTime
+     *
+     * @param {*} responseObj
+    /**
+     *  Function used to extract email addreess from a string by using out of box script include : UserReportedPhishing 
+     *
+     * @param {*} responseObj
+     */
+	processIncidents: function(responseObj) {
+		gs.debug("Response count : " + responseObj.metadata.count);
+		for (var i = 0; i < responseObj.metadata.count; i++) {
+			if(!this.processMessageID(responseObj.incidents[i], false)){
+				if(!this.processCID(responseObj.incidents[i])){
+					gs.warn("Alert not found for corresponding Incident ID :" + responseObj.incidents[i].id);
+					if(gs.getProperty('x_ingmb_phishlabs.can_create_incident_from_api') == 'true'){
+						var sir = this.createSecurityIncident(responseObj.incidents[i]);
+						this.updateSecurityIncident(sir, responseObj.incidents[i]);
+					}
+				}
+			}
+		}
+	},
+
+	processMessageID: function(incident, ignoreSender){
+		var messageID = incident.details.messageID;
+
+		if(messageID != null && messageID.indexOf('<') == 0){
+			messageID = messageID.substring(1, messageID.length - 1);
+		}
+
+
+		var senderEmail = new sn_sec_cmn.UserReportedPhishing();
+		var email = senderEmail._extractEmailAddress(incident.details.emailReportedBy);
+
+		var secInc = new GlideRecord('sn_si_incident');
+		secInc.addEncodedQuery('contact_type=Phishing Employee');
+
+		if(ignoreSender){
+			secInc.addNotNullQuery('affected_user');
+		}else{
+			secInc.addNullQuery('affected_user').addOrCondition('affected_user.email', email).addOrCondition('cmdb_ci.serial_number', email);
+		}
+		//secInc.addQuery('affected_user.email', email).addOrCondition('cmdb_ci.serial_number', email);
+
+		//Match based on messageID STRY1515857
+		secInc.addQuery('u_phishlabs_message_id', messageID);
+		secInc.addNotNullQuery('u_phishlabs_message_id');
+		secInc.addNullQuery('correlation_id').addOrCondition('correlation_id', incident.id);
+		secInc.query();
+
+		if (secInc.next()) {
+			gs.debug("Found a match for PhishLabs Incident : " + incident.id + " using MessageID");
+
+			if (this.needsUpdate(secInc, incident)) {
+				this.updateSecurityIncident(secInc, incident);
+			}
+			this.getAttachments(incident.details.attachments, secInc.getUniqueValue());
+
+			return true;
+		}else if (!ignoreSender){
+			this.processMessageID(incident, true);
+		}	else {
+			return false;
+		}
+	},
+
+	needsUpdate: function(secInc, incident){
+		var isoFormat = new ConvertISOToDateTime();
+		var modified = secInc.u_modified == '' || secInc.u_modified != isoFormat.ISODateTimeToGlideDateTime(incident.modified);
+		var closed = secInc.u_closed == '' && incident.closed != null;
+		var closingClassification = incident.status == 'Closed' && (incident.details.classification == 'No Threat Detected' || incident.details.classification == 'Do Not Engage' 
+																	|| incident.details.classification == 'Simulation');
+
+		return secInc.active && (modified || closed || closingClassification);
+
+	},
+
+
+	processCID: function(incident) {
+		var secInc = new GlideRecord('sn_si_incident');
+		secInc.addEncodedQuery('correlation_id!=NULL^contact_type=Phishing Employee');
+		secInc.addQuery('correlation_id',incident.id);
+		secInc.query();
+		if (secInc.hasNext()) {
+			gs.debug("Found a match for PhishLabs Incident : " + incident.id);
+			var isoFormat = new ConvertISOToDateTime();
+			while (secInc.next()) {
+				if (this.needsUpdate(secInc, incident)) {
+					this.updateSecurityIncident(secInc, incident);
+				}
+				this.getAttachments(incident.details.attachments, secInc.getUniqueValue());
+			}
+			return true;
+		}
+		return false;
+	},
+
+	updateSecurityIncident: function(secInc, incident){
+		var isoFormat = new ConvertISOToDateTime();
+		secInc.correlation_id = incident.id;
+		secInc.u_classification = incident.details.classification;
+		secInc.u_subclassification = incident.details.subClassification;
+		secInc.u_severity = incident.details.severity;
+		secInc.u_submission_method = incident.details.submissionMethod;
+		secInc.u_further_review_reason = incident.details.furtherReviewReason;
+		secInc.u_offline_upon_review = incident.details.offlineUponReview;
+		secInc.u_case_type = incident.details.caseType;
+		secInc.u_created = isoFormat.ISODateTimeToGlideDateTime(incident.created);
+		secInc.u_modified = isoFormat.ISODateTimeToGlideDateTime(incident.modified);
+		if(incident.closed != null){
+			secInc.u_closed = isoFormat.ISODateTimeToGlideDateTime(incident.closed);
+		}
+
+		//STRY1685000
+		secInc.u_phishlabs_payload_family = incident.details.payloadFamily;
+		secInc.u_phishlabs_campaign = incident.details.campaignLabel;
+
+		gs.debug("Email addresses length : " + incident.details.emailAddresses.length);
+		for (var j = 0; j < incident.details.emailAddresses.length; j++) {
+			if (incident.details.emailAddresses[j].malicious == 'true') {
+				var observable = new GlideRecord('sn_ti_observable');
+				observable.get('name', incident.details.emailAddresses[j].address);
+
+				if(!observable.isValidRecord()){
+					observable = this.createObservable(incident.details.emailAddresses[j].address, secInc.getUniqueValue());
+				}
+				gs.debug("Found the type now searching in the observables table for value: " + observable.sys_id);
+				var securityTag = new GlideRecord('sn_sec_cmn_security_tag');
+				securityTag.get('name', 'PhishLabs - Verified Malicious');
+
+				var tag = new GlideRecord("sn_sec_cmn_applied_security_tag");
+				tag.initialize();
+				tag.security_tag = securityTag.getUniqueValue();
+				tag.record_id = observable.getUniqueValue();
+				tag.record_table = "sn_ti_observable";
+				tag.insert();
+
+			}
+		}
+
+		if (incident.status == 'Closed' && (incident.details.classification == 'No Threat Detected' || incident.details.classification == 'Do Not Engage' || incident.details.classification == 'Simulation')) {
+			// Assignee set as PhishLabs
+			secInc.assigned_to = gs.getProperty('x_ingmb_phishlabs.phishlabs.user');
+			// Close code set as false positive (2) or 	Security test
+			secInc.close_code = incident.details.classification == 'Simulation' ? 'Security test' : 2;
+			secInc.close_notes = incident.details.classification;
+			// Alert substate is set as Alert closed
+			secInc.substate = 26;
+		}
+
+		//replace email parser
+		if(incident.details.classification == "Malicious" || incident.details.classification == "Further Investigation Required"){
+			var priority = {
+				"Critical" : 1,
+				"High" : 2,
+				"Medium" : 3,
+				"Low" : 4,
+				"None" : 4
+			};
+
+			var apac = ["CN","HK","IN","JP","KR","KZ","LK","MN","MY","PH","SG","TH","TW","AU"];
+			var groupName = "SDC Europe";
+			if(apac.indexOf(secInc.getDisplayValue('location')) != -1){
+				groupName = "SDC APAC";
+			}
+			//STRY1881478
+			// 			var aus = "AU";
+			// 			if(aus.indexOf(secInc.getDisplayValue('location')) != -1 && secInc.getDisplayValue('location') != ''){
+			// 				groupName = "AU CERT";
+			// 			}
+
+			var ag = new GlideRecord('sys_user_group');
+			ag.get('name', groupName);
+			//STRY2130774 : The default priority should be P3
+			//secInc.priority = incident.details.severity != null ? priority[incident.details.severity] : 3;
+			//Response Review(23) or Security Triage(24)
+			secInc.substate = incident.details.classification == "Malicious" ? 24 : 23;
+			//INC4484566
+			if(secInc.getValue('assignment_group') != ag.getUniqueValue()){
+				secInc.assignment_group = ag.getUniqueValue();
+				secInc.assigned_to = '';
+			}
+		}
+
+		secInc.update();
+	},
+
+	createSecurityIncident: function(incident){
+		var alertSensor = new GlideRecord('sn_si_alert_sensor');
+		alertSensor.get('alert_sensor', 'User Reported Phish');
+		var senderEmail = new sn_sec_cmn.UserReportedPhishing();
+		var email = senderEmail._extractEmailAddress(incident.details.emailReportedBy);
+		var sender = senderEmail._extractEmailAddress(incident.details.sender);
+
+		var reportedBy = new GlideRecord('sys_user');
+		reportedBy.get('email', email);
+
+		var messageID = incident.details.messageID;
+
+		if(messageID != null && messageID.indexOf('<') == 0){
+			messageID = messageID.substring(1, messageID.length - 1);
+		}
+
+		var ag = new GlideRecord('sys_user_group');
+		ag.get('name', 'PhishLabs');
+
+		var at = new GlideRecord('sys_user');
+		at.get('user_name', 'phishlabs');
+
+		var secInc = new GlideRecord('sn_si_incident');
+		secInc.initialize();
+		secInc.short_description = 'User Reported Phishing: ' + incident.title;
+		secInc.contact_type = 'Phishing Employee';
+		secInc.alert_sensor = alertSensor.getUniqueValue();
+		secInc.category = 'social_engineering';
+		secInc.subcategory = 'phishing_email';
+		secInc.caller = reportedBy.getUniqueValue();
+		secInc.affected_user = reportedBy.getUniqueValue();
+		secInc.assigned_to = at.getUniqueValue();
+		secInc.assignment_group = ag.getUniqueValue();
+		secInc.u_phishlabs_message_id = messageID;
+		secInc.description = 'Sender: ' + sender + '\n' + 'MessageId: ' + messageID + "\nEmail body:\n" + incident.details.emailBody;
+		secInc.correlation_id = incident.id;
+
+		secInc.insert();
+		return secInc;
+	},
+
+	getAttachments: function(attachments, sirSysID){
+		for(var i = 0; i < attachments.length; i++){
+			//checks if the attachment is type screenshot and if it was not saved before
+			if(attachments[i].type == 'screenshot' && !this.checkIfAttachmentExists(attachments[i].fileName, sirSysID)){
+				try { 
+					gs.debug('Getting attachment ' + attachments[i].fileName);
+					var r = new sn_ws.RESTMessageV2();
+					r.setHttpMethod('get');
+					r.setEndpoint(attachments[i].url);
+
+					r.saveResponseBodyAsAttachment('sn_si_incident', sirSysID, attachments[i].fileName);
+
+					var response = r.execute();
+				}
+				catch(ex) {
+					var message = ex.message;
+					gs.error(message);
+				}
+			}
+		}
+	},
+
+	checkIfAttachmentExists: function(fileName, sirSysID){
+		var attach = new GlideRecord('sys_attachment'); 
+		attach.addQuery('table_sys_id','=', sirSysID);
+		attach.addQuery('file_name', fileName);
+
+		attach.query();
+
+		return attach.hasNext();
+	},
+
+	getByMessageID: function(){
+		gs.debug('Getting Records using Message ID');
+
+		var secInc = new GlideRecord('sn_si_incident');
+		secInc.addEncodedQuery('contact_type=Phishing Employee');
+		secInc.addNotNullQuery('u_phishlabs_message_id');
+		secInc.addNullQuery('u_closed');
+		secInc.addActiveQuery();
+		secInc.query();
+
+		while(secInc.next()){
+			try { 
+				var r = new sn_ws.RESTMessageV2('x_ingmb_phishlabs.PhishLabs Incident', 'Get By Message ID');
+				//add encoded <> at beggining and end of message ID
+				r.setStringParameterNoEscape('messageID', '%3C' +secInc.getValue('u_phishlabs_message_id') + '%3E');
+
+				var response = r.execute();
+				var responseBody = response.getBody();
+				var httpStatus = response.getStatusCode();
+
+
+				if (httpStatus == 200) {
+					var responseObj = JSON.parse(responseBody);
+					this.processIncidents(responseObj);
+				}
+			}
+			catch(ex) {
+				var message = ex.message;
+				gs.error(message);
+			}
+		}
+	},
+
+	createObservable: function(name, sirID){
+		var observableType = new GlideRecord('sn_ti_observable_type');
+		observableType.get('name', 'Email address');		
+
+		if(observableType.isValidRecord()){
+			var observableGr = new GlideRecord("sn_ti_observable");
+			observableGr.initialize();
+			observableGr.setValue("value", name);
+			observableGr.setValue("type", observableType.getUniqueValue());
+			observableGr.insert();
+
+			this.linkObservables(observableGr.getUniqueValue(), sirID);
+			return observableGr;
+		}
+	},
+
+	linkObservables: function(observableID, sirID){
+		var observableIncident = new GlideRecord('sn_ti_m2m_task_observable');
+		observableIncident.initialize();
+		observableIncident.observable = observableID;
+		observableIncident.task = sirID;
+		observableIncident.insert();
+	},
+
+	isCustomerPhishing: function(secInc){
+		var matchWords = ['sms', 'fraud', 'frauduleux', 'compte', 'mijn', 'carte', 'smishing', 'whatsapp', 'verleng', 'mobiele', 'card', 'app'];
+		var shortDescription = current.getValue('short_description').toLowerCase();
+
+		for(var i = 0; i <matchWords.length; i++){
+			if(shortDescription.contains(matchWords[i])){
+				return true;
+			}
+		}
+		return false;
+	},
+
+	type: 'GetIncidents'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>nawaid.anjum</sys_created_by>
+        <sys_created_on>2021-04-29 12:10:32</sys_created_on>
+        <sys_id>255a6eb52f3320102d00d5ccf699b6e0</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>GetIncidents</sys_name>
+        <sys_package display_value="Phishlabs" source="x_10255_phishlabs">58a926b52f3320102d00d5ccf699b6c4</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Phishlabs">58a926b52f3320102d00d5ccf699b6c4</sys_scope>
+        <sys_update_name>sys_script_include_255a6eb52f3320102d00d5ccf699b6e0</sys_update_name>
+        <sys_updated_by>nawaid.anjum</sys_updated_by>
+        <sys_updated_on>2021-04-29 12:10:32</sys_updated_on>
+    </sys_script_include>
+</record_update>

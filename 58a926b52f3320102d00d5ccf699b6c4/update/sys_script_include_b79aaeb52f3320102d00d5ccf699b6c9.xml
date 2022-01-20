@@ -1,0 +1,233 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_10255_phishlabs.GetObervables</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description/>
+        <name>GetObervables</name>
+        <script><![CDATA[var GetObervables = Class.create();
+GetObervables.prototype = {
+	initialize: function() {
+		var falsePositive;
+	},
+
+	getByID: function(referenceID, securityIncidentSysID){
+		var offset = 0;
+		var limit = 100;
+		var total = 0;
+		var since = gs.getProperty('x_ingmb_phishlabs.since');
+
+		do {
+			var response = this.serverCall(offset, limit,since);
+			var responseObj = JSON.parse(response);
+
+			total = responseObj.meta.count;
+			offset += limit;
+			if(response.includes(referenceID)){
+				this.processObservables(responseObj, referenceID, securityIncidentSysID);
+			}
+		} while (offset < total);
+	},
+
+	serverCall: function(offset, limit,since){
+		try {
+			var r = new sn_ws.RESTMessageV2('x_ingmb_phishlabs.PhishLabs IOC', 'GET Feed');
+			r.setStringParameterNoEscape('offset', offset);
+			r.setStringParameterNoEscape('limit', limit);
+			r.setStringParameterNoEscape('since', since);
+
+			var response = r.execute();
+			var responseBody = response.getBody();
+			var httpStatus = response.getStatusCode();
+			if(httpStatus == 200){
+				gs.debug("Received data from PhishLabs IOC API");
+				return responseBody;
+			}
+			// TODO add other status codes
+		}
+		catch(ex) {
+			var message = ex.message;
+			gs.error("Error: " + message);
+		}
+	},
+
+	processObservables: function(responseObj, referenceID, securityIncidentSysID){
+
+		gs.debug("Starting to process observables");
+		for(var i =0; i < responseObj.data.length; i++){
+			if(responseObj.data[i].referenceId == referenceID){
+				gs.debug("Found our case based on reference ID: " + referenceID);
+				this.processObservable(responseObj.data[i].indicators, securityIncidentSysID);
+			}
+		} 
+	},
+
+	processObservable: function(indicators, securityIncidentSysID){
+
+		var observables = [];
+
+		for(var i = 0; i < indicators.length; i++){
+			gs.debug("Process Indicator ");
+			if(indicators[i].type == 'E-mail'){
+				gs.debug("Processing E-mail type indicator");
+				var indEmailSubject = {
+					"type" : "Email subject",
+					"value" : indicators[i].value
+				};
+				var ind1 = this.retrieveOrCreateObservable(indEmailSubject);
+
+				if(ind1){
+					observables.push(ind1);
+				}
+
+				for(var j = 0; j<indicators[i].attributes.length; j++){
+					if(indicators[i].attributes[j].name == "email-body"){
+						gs.debug("Processing email-body type indicator");
+						var indEmailBody = {};
+						indEmailBody.type = 'Email body';
+						indEmailBody.value = indicators[i].attributes[j].value;
+						var ind2 = this.retrieveOrCreateObservable(indEmailBody);                      
+						if(ind2){
+							observables.push(ind2);   
+						}
+					}
+				}      
+			}else{
+				gs.debug("Starting to process other types of indicators");
+				var indicator = this.retrieveOrCreateObservable(indicators[i]);
+				if(indicator){
+					observables.push(indicator);  
+				}
+			}
+		}
+
+		this.linkObservables(observables, securityIncidentSysID);
+	},
+
+	retrieveOrCreateObservable: function(indicator){
+		try {
+			var type = indicator.type;
+			var malicious = !indicator.falsePositive;
+
+			var observableType = new GlideRecord('sn_ti_observable_type');
+			// Searching for observable type based on PhishLab indicator type
+			// in both systems we have URL as observable/indicator type
+			observableType.query('name', type);
+			gs.debug("Seaching in oberservables type table for Type: " + type);
+
+			if(observableType.next()){
+				// we have found an observable type
+				var observable = new GlideRecord('sn_ti_observable');
+				gs.debug("Found the type now searching in the observables table for value: " + indicator.value);
+				observable.addQuery('type.value', observableType.getValue('value'));
+				observable.addQuery('value', indicator.value.trim());
+				observable.query();
+
+				if(!observable.next()){
+					// if we have not found the observable based on value we will create it
+					gs.debug("Not found a matching observable value so we are going create an observable:" + indicator.value);
+					observable.initialize();
+					observable.type = observableType.sys_id + '';
+					observable.value = indicator.value.trim();
+					observable.insert();
+				}
+				
+				// we always check for malicous indicators
+				if(malicious && type == 'URL'){
+					observable.finding = 'Malicious';
+					observable.update();
+					
+					var securityTag = new GlideRecord('sn_sec_cmn_security_tag');
+					securityTag.get('name', 'PhishLabs - Verified Malicious');
+
+					var tag = new GlideRecord("sn_sec_cmn_applied_security_tag");
+					tag.initialize();
+					tag.security_tag = securityTag.sys_id+'';
+					tag.record_id = observable.sys_id +'';
+					tag.record_table = "sn_ti_observable";
+					tag.insert();
+					
+					// Send observable off for Threat Lookup Integration
+					this.syncTL(observable);
+					
+					gs.debug("Found a malicious indicator setting security tag for observable: " + indicator.value);
+				} else {
+					gs.debug("Not setting Security tag for PhishLabs non malicious incicator");
+				}
+				return observable.sys_id + '';
+			} else { 
+				gs.warn("Not found the type skipping Phishlabs indicator type: " + type);
+			}
+			return '';
+		}
+		catch(ex) {
+			var message = ex.message;
+			gs.error("Failed to create or update the observable, error: " + message);
+		}
+	},
+
+	linkObservables: function(observables, securityIncidentSysID){
+		for(var i = 0; i < observables.length; i++){
+			var observableIncident = new GlideRecord('sn_ti_m2m_task_observable');
+			observableIncident.addQuery('observable', observables[i]);
+			observableIncident.addQuery('task', securityIncidentSysID);
+			observableIncident.query();
+
+			if(!observableIncident.next()){
+				observableIncident.initialize();
+				observableIncident.observable = observables[i];
+				observableIncident.task = securityIncidentSysID;
+
+				observableIncident.update();
+			}
+		}
+	},
+	
+	syncTL: function(observable){
+		
+		var sysID = observable.getValue('sys_id');
+		var gdt = new GlideDateTime();
+		var tl = new GlideRecord('sn_ti_lookup_result');
+		tl.addQuery('observable', sysID);
+		tl.query();
+		
+		if(tl.next()){
+			tl.retrieval_date = gdt;
+			tl.details = 'PhishLabs Malicious, Sighting count - ' + observable.getValue('sighting_count');
+			tl.update();
+		}
+		else{
+			tl = new GlideRecord('sn_ti_lookup_result');
+			tl.initialize();
+			tl.observable = sysID;
+			tl.finding = 'Malicious';
+			tl.vendor = gs.getProperty('x_ingmb_phishlabs.phishlabs.integration_item');
+			tl.security_tags = observable.getValue('security_tags');
+			tl.first_found = gdt;
+			tl.retrieval_date = gdt;
+			tl.source_engine = 'PhishLabs';
+			tl.source_engine_version = '1';
+			tl.details = 'PhishLabs Malicious, Sighting count - ' + observable.getValue('sighting_count');
+			tl.result = 'Malicious';
+			tl.insert();
+		}
+	},
+
+	type: 'GetObervables'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>nawaid.anjum</sys_created_by>
+        <sys_created_on>2021-04-29 12:12:32</sys_created_on>
+        <sys_id>b79aaeb52f3320102d00d5ccf699b6c9</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>GetObervables</sys_name>
+        <sys_package display_value="Phishlabs" source="x_10255_phishlabs">58a926b52f3320102d00d5ccf699b6c4</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Phishlabs">58a926b52f3320102d00d5ccf699b6c4</sys_scope>
+        <sys_update_name>sys_script_include_b79aaeb52f3320102d00d5ccf699b6c9</sys_update_name>
+        <sys_updated_by>nawaid.anjum</sys_updated_by>
+        <sys_updated_on>2021-04-29 12:12:32</sys_updated_on>
+    </sys_script_include>
+</record_update>
